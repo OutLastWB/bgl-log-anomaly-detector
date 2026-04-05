@@ -19,8 +19,20 @@ from sklearn.metrics import (
 from sklearn.preprocessing import LabelEncoder
 
 MAX_LINES = 10_000
+# Streamlit Cloud default upload cap (see deployment docs / server.maxUploadSize).
+MAX_UPLOAD_MB = 200
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 _TS_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?)\b")
+
+
+def _uploaded_file_size_bytes(uploaded_file) -> int:
+    """Return upload size in bytes without reading file contents beyond buffer metadata."""
+    pos = uploaded_file.tell()
+    uploaded_file.seek(0, 2)
+    size = uploaded_file.tell()
+    uploaded_file.seek(pos)
+    return size
 
 
 def _decode_uploaded_line(line_b: bytes) -> str:
@@ -241,6 +253,15 @@ def confusion_matrix_table(y_true, y_pred) -> pd.DataFrame:
 def main():
     st.set_page_config(page_title="BGL log preview", layout="wide")
 
+    st.warning(
+        "⚠️ Maximum file size is 200MB (Streamlit Cloud limit). "
+        "For larger logs, please upload a smaller sample."
+    )
+    st.info(
+        "This app processes only up to 10,000 lines using efficient sampling, "
+        "so you can upload a smaller portion of your log file."
+    )
+
     uploaded = st.file_uploader(
         "Upload a log file",
         type=["log", "txt"],
@@ -248,6 +269,17 @@ def main():
     )
     if uploaded is None:
         st.warning("Please upload a log file to continue.")
+        st.stop()
+
+    upload_size = _uploaded_file_size_bytes(uploaded)
+    uploaded.seek(0)
+    if upload_size > MAX_UPLOAD_BYTES:
+        size_mb = upload_size / (1024 * 1024)
+        st.error(
+            f"This file is about **{size_mb:.1f} MB**, which exceeds the "
+            f"**{MAX_UPLOAD_MB} MB** limit supported on Streamlit Cloud. "
+            "Please export a smaller slice of your log (for example, the first few hundred thousand lines) and try again."
+        )
         st.stop()
 
     with st.sidebar:
