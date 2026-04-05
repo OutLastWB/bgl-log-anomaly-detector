@@ -1,5 +1,5 @@
 """
-Streamlit app: preview BGL logs from disk, parse lines, and run Isolation Forest anomaly detection.
+Streamlit app: upload BGL-style logs, sample lines, parse, and run Isolation Forest anomaly detection.
 """
 
 import random
@@ -18,53 +18,64 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import LabelEncoder
 
-LOG_PATH = r"C:\Users\bklen\OneDrive\Desktop\BGL.log\BGL.log"
 MAX_LINES = 10_000
 
 _TS_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?)\b")
 
 
-def read_first_lines(path: str, max_lines: int) -> pd.DataFrame:
-    """Stream the file line-by-line and stop after max_lines."""
-    messages: list[str] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            if i >= max_lines:
-                break
-            messages.append(line.rstrip("\n\r"))
-    return pd.DataFrame({"message": messages})
+def _decode_uploaded_line(line_b: bytes) -> str:
+    return line_b.decode("utf-8", errors="replace").rstrip("\n\r")
 
 
-def reservoir_sample_lines(path: str, k: int, rng: random.Random) -> list[str]:
+def read_first_n_uploaded(uploaded_file, max_lines: int) -> list[str]:
+    """Read the first max_lines text lines from an upload (binary readline, UTF-8)."""
+    uploaded_file.seek(0)
+    lines: list[str] = []
+    for _ in range(max_lines):
+        raw = uploaded_file.readline()
+        if not raw:
+            break
+        lines.append(_decode_uploaded_line(raw))
+    return lines
+
+
+def reservoir_sample_uploaded(uploaded_file, k: int, rng: random.Random) -> list[str]:
     """
-    Uniform random sample of up to k lines from a large file in one pass.
+    Uniform random sample of up to k lines from an upload in one pass (reservoir sampling).
 
-    Uses reservoir sampling: O(k) memory, reads the whole file once (no full load).
-    If the file has fewer than k lines, all lines are returned.
+    Only k lines are retained in memory at once; the upload is streamed via readline().
     """
+    uploaded_file.seek(0)
     reservoir: list[str] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for i, line in enumerate(f):
-            line = line.rstrip("\n\r")
-            if i < k:
-                reservoir.append(line)
-            else:
-                j = rng.randint(0, i)
-                if j < k:
-                    reservoir[j] = line
+    i = 0
+    while True:
+        raw = uploaded_file.readline()
+        if not raw:
+            break
+        line = _decode_uploaded_line(raw)
+        if i < k:
+            reservoir.append(line)
+        else:
+            j = rng.randint(0, i)
+            if j < k:
+                reservoir[j] = line
+        i += 1
     return reservoir
 
 
-@st.cache_data(show_spinner="Loading log sample...")
-def load_log_sample(path: str, mode: str, max_lines: int, sample_seed: int) -> pd.DataFrame:
-    """
-    Load ~max_lines log lines. mode: 'first' = head of file; 'random' = reservoir sample.
-    Cached so the full file is not re-scanned on every Streamlit widget change.
-    """
+def load_log_sample_from_upload(
+    uploaded_file,
+    mode: str,
+    max_lines: int,
+    sample_seed: int,
+) -> pd.DataFrame:
+    """Build ~max_lines rows from an uploaded file. mode: 'first' or 'random'."""
     if mode == "first":
-        return read_first_lines(path, max_lines)
-    rng = random.Random(sample_seed)
-    lines = reservoir_sample_lines(path, max_lines, rng)
+        lines = read_first_n_uploaded(uploaded_file, max_lines)
+    else:
+        lines = reservoir_sample_uploaded(
+            uploaded_file, max_lines, random.Random(sample_seed)
+        )
     return pd.DataFrame({"message": lines})
 
 
@@ -230,6 +241,15 @@ def confusion_matrix_table(y_true, y_pred) -> pd.DataFrame:
 def main():
     st.set_page_config(page_title="BGL log preview", layout="wide")
 
+    uploaded = st.file_uploader(
+        "Upload a log file",
+        type=["log", "txt"],
+        help="Plain-text logs (e.g. BGL). Works on Streamlit Cloud without local paths.",
+    )
+    if uploaded is None:
+        st.warning("Please upload a log file to continue.")
+        st.stop()
+
     with st.sidebar:
         st.header("Sampling")
         sampling_mode = st.radio(
@@ -237,7 +257,7 @@ def main():
             options=["random", "first"],
             index=0,
             format_func=lambda m: (
-                f"Random sample ({MAX_LINES:,} lines from full file)"
+                f"Random sample ({MAX_LINES:,} lines from full upload)"
                 if m == "random"
                 else f"First {MAX_LINES:,} lines only"
             ),
@@ -251,14 +271,14 @@ def main():
             help="Change the seed to draw a different random sample. Ignored for 'first N lines'.",
         )
         st.caption(
-            "Random mode uses **reservoir sampling**: one pass through the file, "
-            f"only **{MAX_LINES:,}** lines kept in memory. The first run may take a while on huge logs."
+            "Random mode uses **reservoir sampling**: one pass through the upload, "
+            f"only **{MAX_LINES:,}** lines kept in memory. Large uploads may take longer to scan."
         )
 
     st.title("BGL log preview")
     if sampling_mode == "random":
         st.caption(
-            f"**{MAX_LINES:,}** lines drawn by **uniform random sampling** over the full file "
+            f"**{MAX_LINES:,}** lines drawn by **uniform random sampling** over the full upload "
             f"(seed **{sample_seed}**). Not the same as file order."
         )
     else:
@@ -267,13 +287,13 @@ def main():
         )
 
     try:
-        df = load_log_sample(LOG_PATH, sampling_mode, MAX_LINES, int(sample_seed))
-    except FileNotFoundError:
-        st.error(f"Log file not found. Check that this path exists:\n`{LOG_PATH}`")
-        return
-    except OSError as e:
-        st.error(f"Could not read the log file: {e}")
-        return
+        with st.spinner("Loading log sample from upload..."):
+            df = load_log_sample_from_upload(
+                uploaded, sampling_mode, MAX_LINES, int(sample_seed)
+            )
+    except Exception as e:
+        st.error(f"Could not read the uploaded file: {e}")
+        st.stop()
 
     with st.spinner("Parsing log lines..."):
         df, parse_ok = add_parsed_columns(df)
