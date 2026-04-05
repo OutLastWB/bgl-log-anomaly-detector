@@ -365,116 +365,100 @@ def main():
 
     if len(df) < 2:
         st.info("Need at least 2 log lines to run anomaly detection.")
-        return
-
-    with st.spinner("Running Isolation Forest..."):
-        df = run_isolation_forest(df)
-
-    df = add_ground_truth_labels(df)
-    y_true = df["true_anomaly"]
-    y_pred = df["anomaly"]
-
-    st.divider()
-    st.subheader("Anomaly detection (Isolation Forest)")
-    st.caption(
-        "Features: message length, hour, node/type counts in this sample, "
-        "label-encoded node and type. **contamination = 0.05**"
-    )
-
-    st.subheader("Evaluation vs BGL ground truth")
-    n_normal_gt = int((y_true == 0).sum())
-    n_anom_gt = int((y_true == 1).sum())
-    st.caption(
-        "**true_anomaly** = **0** only when the first field of the line is **`-`** "
-        "(normal); **1** for any other first token (e.g. **E**, **APPREAD**). "
-        "Derived from the raw **message** line (first token, Unicode dash normalized). "
-        f"In this sample: **{n_normal_gt:,}** normal, **{n_anom_gt:,}** true anomalies. "
-        "Compared to model **anomaly** (Isolation Forest). Positive class = **1** (anomaly)."
-    )
-
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
-    rec = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
-    f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
-
-    e1, e2, e3, e4 = st.columns(4)
-    e1.metric("Accuracy", f"{acc:.4f}")
-    e2.metric("Precision", f"{prec:.4f}")
-    e3.metric("Recall", f"{rec:.4f}")
-    e4.metric("F1-score", f"{f1:.4f}")
-
-    st.subheader("Confusion matrix")
-    st.dataframe(
-        confusion_matrix_table(y_true, y_pred),
-        use_container_width=True,
-    )
-
-    total = len(df)
-    n_anom = int(df["anomaly"].sum())
-    pct = 100.0 * n_anom / total if total else 0.0
-
-    st.subheader("Model output summary")
-    m1, m2 = st.columns(2)
-    m1.metric("Predicted anomalies", f"{n_anom:,}")
-    m2.metric("Predicted anomaly rate", f"{pct:.2f}%")
-
-    anomalies = df[df["anomaly"] == 1]
-    st.subheader("Anomalous logs")
-    if anomalies.empty:
-        st.success("No rows flagged as anomalies with the current settings.")
+        df = add_ground_truth_labels(df)
+        df["anomaly"] = 0
     else:
-        show_cols = [
-            "timestamp",
-            "node",
-            "type",
-            "clean_message",
-            "clean_msg_length",
-            "hour_of_day",
-            "anomaly",
-        ]
-        st.dataframe(
-            anomalies[show_cols],
-            use_container_width=True,
-            hide_index=True,
+        with st.spinner("Running Isolation Forest..."):
+            df = run_isolation_forest(df)
+
+        df = add_ground_truth_labels(df)
+        y_true = df["true_anomaly"]
+        y_pred = df["anomaly"]
+
+        st.divider()
+        st.subheader("Anomaly detection (Isolation Forest)")
+        st.caption(
+            "Features: message length, hour, node/type counts in this sample, "
+            "label-encoded node and type. **contamination = 0.05**"
         )
 
-    st.subheader("Export results")
-    export_cols = [
-        c
-        for c in (
-            "label",
-            "timestamp",
-            "node",
-            "type",
-            "clean_message",
-            "message",
-            "msg_length",
-            "clean_msg_length",
-            "hour_of_day",
-            "true_anomaly",
-            "anomaly",
+        st.subheader("Evaluation vs BGL ground truth")
+        n_normal_gt = int((y_true == 0).sum())
+        n_anom_gt = int((y_true == 1).sum())
+        st.caption(
+            "**true_anomaly** = **0** only when the first field of the line is **`-`** "
+            "(normal); **1** for any other first token (e.g. **E**, **APPREAD**). "
+            "Derived from the raw **message** line (first token, Unicode dash normalized). "
+            f"In this sample: **{n_normal_gt:,}** normal, **{n_anom_gt:,}** true anomalies. "
+            "Compared to model **anomaly** (Isolation Forest). Positive class = **1** (anomaly)."
         )
-        if c in df.columns
-    ]
-    csv_payload = df[export_cols].to_csv(index=False).encode("utf-8")
+
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
+        rec = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+        f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Accuracy", f"{acc:.4f}")
+        e2.metric("Precision", f"{prec:.4f}")
+        e3.metric("Recall", f"{rec:.4f}")
+        e4.metric("F1-score", f"{f1:.4f}")
+
+        st.subheader("Confusion matrix")
+        st.dataframe(
+            confusion_matrix_table(y_true, y_pred),
+            use_container_width=True,
+        )
+
+        total = len(df)
+        n_anom = int(df["anomaly"].sum())
+        pct = 100.0 * n_anom / total if total else 0.0
+
+        st.subheader("Model output summary")
+        m1, m2 = st.columns(2)
+        m1.metric("Predicted anomalies", f"{n_anom:,}")
+        m2.metric("Predicted anomaly rate", f"{pct:.2f}%")
+
+        anomalies = df[df["anomaly"] == 1]
+        st.subheader("Anomalous logs")
+        if anomalies.empty:
+            st.success("No rows flagged as anomalies with the current settings.")
+        else:
+            show_cols = [
+                "timestamp",
+                "node",
+                "type",
+                "clean_message",
+                "clean_msg_length",
+                "hour_of_day",
+                "anomaly",
+            ]
+            st.dataframe(
+                anomalies[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.subheader("Export Results")
+    csv_data = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         label="Download processed results (CSV)",
-        data=csv_payload,
+        data=csv_data,
         file_name="anomaly_results.csv",
         mime="text/csv",
-        help="Includes parsed fields, ground truth (true_anomaly), and model predictions (anomaly).",
     )
 
-    st.subheader("Anomalies in the sample (row index)")
-    viz = df.copy()
-    viz["row_index"] = range(len(viz))
-    viz["status"] = viz["anomaly"].map({0: "normal", 1: "anomaly"})
-    st.scatter_chart(
-        viz,
-        x="row_index",
-        y="clean_msg_length",
-        color="status",
-    )
+    if len(df) >= 2:
+        st.subheader("Anomalies in the sample (row index)")
+        viz = df.copy()
+        viz["row_index"] = range(len(viz))
+        viz["status"] = viz["anomaly"].map({0: "normal", 1: "anomaly"})
+        st.scatter_chart(
+            viz,
+            x="row_index",
+            y="clean_msg_length",
+            color="status",
+        )
 
 
 if __name__ == "__main__":
