@@ -1,12 +1,20 @@
 """
-Streamlit app: upload BGL-style logs, sample lines, parse, and run Isolation Forest anomaly detection.
+Streamlit app: authenticated log upload, sampling, BGL parsing, and Isolation Forest anomaly detection.
+Refactored for production-style layout and a reusable process_log_file() API (FastAPI-ready).
 """
+
+from __future__ import annotations
 
 import random
 import re
-from typing import Tuple
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import BinaryIO, Tuple, Union
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import (
@@ -18,16 +26,26 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import LabelEncoder
 
+# --- Auth (replace in production; use secrets management) ---
+USERS: dict[str, str] = {
+    "admin": "changeme",
+    "demo": "demo123",
+}
+
 MAX_LINES = 10_000
-# Streamlit Cloud default upload cap (see deployment docs / server.maxUploadSize).
 MAX_UPLOAD_MB = 200
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
+UPLOAD_DIR = Path("uploads")
 _TS_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?)\b")
 
 
-def _uploaded_file_size_bytes(uploaded_file) -> int:
-    """Return upload size in bytes without reading file contents beyond buffer metadata."""
+# ---------------------------------------------------------------------------
+# File / sampling helpers (reservoir sampling unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _uploaded_file_size_bytes(uploaded_file: BinaryIO) -> int:
     pos = uploaded_file.tell()
     uploaded_file.seek(0, 2)
     size = uploaded_file.tell()
@@ -39,8 +57,7 @@ def _decode_uploaded_line(line_b: bytes) -> str:
     return line_b.decode("utf-8", errors="replace").rstrip("\n\r")
 
 
-def read_first_n_uploaded(uploaded_file, max_lines: int) -> list[str]:
-    """Read the first max_lines text lines from an upload (binary readline, UTF-8)."""
+def read_first_n_uploaded(uploaded_file: BinaryIO, max_lines: int) -> list[str]:
     uploaded_file.seek(0)
     lines: list[str] = []
     for _ in range(max_lines):
@@ -51,7 +68,7 @@ def read_first_n_uploaded(uploaded_file, max_lines: int) -> list[str]:
     return lines
 
 
-def reservoir_sample_uploaded(uploaded_file, k: int, rng: random.Random) -> list[str]:
+def reservoir_sample_uploaded(uploaded_file: BinaryIO, k: int, rng: random.Random) -> list[str]:
     """
     Uniform random sample of up to k lines from an upload in one pass (reservoir sampling).
 
@@ -76,7 +93,7 @@ def reservoir_sample_uploaded(uploaded_file, k: int, rng: random.Random) -> list
 
 
 def load_log_sample_from_upload(
-    uploaded_file,
+    uploaded_file: BinaryIO,
     mode: str,
     max_lines: int,
     sample_seed: int,
@@ -89,6 +106,11 @@ def load_log_sample_from_upload(
             uploaded_file, max_lines, random.Random(sample_seed)
         )
     return pd.DataFrame({"message": lines})
+
+
+# ---------------------------------------------------------------------------
+# Parsing & model (Isolation Forest logic unchanged)
+# ---------------------------------------------------------------------------
 
 
 def _parse_timestamp(token: str) -> pd.Timestamp:
@@ -203,29 +225,19 @@ def run_isolation_forest(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_bgl_alert_token(token: str) -> str:
-    """Map Unicode dashes / stray BOM to ASCII '-' so '-' normal lines match."""
     if not token:
         return token
     t = token.strip().strip("\ufeff")
     for u, asc in (
-        ("\u2212", "-"),  # minus sign
-        ("\u2013", "-"),  # en dash
-        ("\u2014", "-"),  # em dash
+        ("\u2212", "-"),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
     ):
         t = t.replace(u, asc)
     return t
 
 
 def add_ground_truth_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    BGL ground truth from the first field of each raw log line (same as dataset spec).
-
-    - Token '-' (after normalization) => normal => true_anomaly 0
-    - Any other token (e.g. 'E', 'APPREAD') => anomaly => true_anomaly 1
-
-    Uses the stored ``message`` line with strip + first token so leading spaces
-    in the file cannot desync ground truth from the parsed ``label`` column.
-    """
     out = df.copy()
     first = (
         out["message"]
@@ -241,7 +253,6 @@ def add_ground_truth_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def confusion_matrix_table(y_true, y_pred) -> pd.DataFrame:
-    """Human-readable confusion matrix (rows = actual, columns = predicted)."""
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     return pd.DataFrame(
         cm,
@@ -250,41 +261,190 @@ def confusion_matrix_table(y_true, y_pred) -> pd.DataFrame:
     )
 
 
-def main():
-    st.set_page_config(page_title="Log Anomaly Detection Dashboard", layout="wide")
+# ---------------------------------------------------------------------------
+# Reusable pipeline (FastAPI / batch jobs)
+# ---------------------------------------------------------------------------
 
-    st.warning(
-        "⚠️ Maximum file size is 200MB (Streamlit Cloud limit). "
-        "For larger logs, please upload a smaller sample."
-    )
-    st.info(
-        "This app processes only up to 10,000 lines using efficient sampling, "
-        "so you can upload a smaller portion of your log file."
+
+def process_log_file(
+    file: Union[str, Path, BinaryIO],
+    *,
+    sampling_mode: str = "random",
+    max_lines: int = MAX_LINES,
+    sample_seed: int = 42,
+) -> Tuple[pd.DataFrame, int]:
+    """
+    Run sampling → parse → features + Isolation Forest → ground-truth labels.
+
+    Parameters
+    ----------
+    file
+        Path to a log file, or a binary file-like object with ``readline`` / ``seek``
+        (e.g. open(path, \"rb\") or Streamlit ``UploadedFile``).
+
+    Returns
+    -------
+    (dataframe, n_parse_failed)
+        ``n_parse_failed`` counts rows that did not match the standard BGL layout.
+    """
+    close_after = False
+    fh: BinaryIO
+    if isinstance(file, (str, Path)):
+        fh = open(file, "rb")
+        close_after = True
+    else:
+        fh = file
+        fh.seek(0)
+
+    try:
+        df = load_log_sample_from_upload(fh, sampling_mode, max_lines, sample_seed)
+        df, parse_ok = add_parsed_columns(df)
+        n_failed = int((~parse_ok).sum())
+        df["msg_length"] = df["message"].str.len()
+
+        if len(df) < 2:
+            df = add_ground_truth_labels(df)
+            df["anomaly"] = 0
+        else:
+            df = run_isolation_forest(df)
+            df = add_ground_truth_labels(df)
+    finally:
+        if close_after:
+            fh.close()
+
+    return df, n_failed
+
+
+# ---------------------------------------------------------------------------
+# Upload persistence
+# ---------------------------------------------------------------------------
+
+
+def save_upload_to_disk(uploaded_file) -> Path:
+    """Write upload bytes to uploads/ with a unique name. Returns destination path."""
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe_base = Path(uploaded_file.name).name.replace("..", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    uid = uuid.uuid4().hex[:10]
+    dest = UPLOAD_DIR / f"{ts}_{uid}_{safe_base}"
+    dest.write_bytes(uploaded_file.getbuffer())
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+
+def render_login() -> None:
+    st.markdown("## Login")
+    st.caption("Sign in to access the Log Anomaly Detection Dashboard.")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if USERS.get(username) == password:
+            st.session_state["logged_in"] = True
+            st.session_state["username"] = username
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+
+def render_charts(df: pd.DataFrame) -> None:
+    """Plotly visualizations (histogram, pie, scatter)."""
+    if df.empty:
+        st.caption("No rows to visualize.")
+        return
+
+    st.markdown("### Visual analytics")
+
+    len_col = "clean_msg_length" if "clean_msg_length" in df.columns else "msg_length"
+    y_title = (
+        "Clean message length (characters)"
+        if len_col == "clean_msg_length"
+        else "Raw line length (characters)"
     )
 
-    uploaded = st.file_uploader(
-        "Upload a log file",
-        type=["log", "txt"],
-        help="Plain-text logs (e.g. BGL). Works on Streamlit Cloud without local paths.",
+    fig_hist = px.histogram(
+        df,
+        x=len_col,
+        nbins=min(50, max(10, len(df) // 5)),
+        title="Histogram: message length distribution",
+        labels={len_col: y_title},
     )
-    if uploaded is None:
-        st.warning("Please upload a log file to continue.")
-        st.stop()
+    fig_hist.update_layout(bargap=0.05, showlegend=False)
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-    upload_size = _uploaded_file_size_bytes(uploaded)
-    uploaded.seek(0)
-    if upload_size > MAX_UPLOAD_BYTES:
-        size_mb = upload_size / (1024 * 1024)
-        st.error(
-            f"This file is about **{size_mb:.1f} MB**, which exceeds the "
-            f"**{MAX_UPLOAD_MB} MB** limit supported on Streamlit Cloud. "
-            "Please export a smaller slice of your log (for example, the first few hundred thousand lines) and try again."
+    if "anomaly" in df.columns:
+        counts = df["anomaly"].value_counts().reindex([0, 1], fill_value=0)
+        labels_pie = ["Predicted normal (0)", "Predicted anomaly (1)"]
+        fig_pie = go.Figure(
+            data=[
+                go.Pie(
+                    labels=labels_pie,
+                    values=[counts[0], counts[1]],
+                    hole=0.35,
+                    marker=dict(line=dict(color="#fff", width=1)),
+                )
+            ]
         )
-        st.stop()
+        fig_pie.update_layout(title_text="Model prediction distribution")
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-    st.caption(f"Uploaded file size: {upload_size / (1024 * 1024):.2f} MB")
+    if len(df) >= 1 and len_col in df.columns:
+        plot_df = df.reset_index(drop=True).reset_index(names="row_index")
+        plot_df["prediction_label"] = plot_df["anomaly"].map(
+            {0: "Normal", 1: "Anomaly"}
+        )
+        fig_scatter = px.scatter(
+            plot_df,
+            x="row_index",
+            y=len_col,
+            color="prediction_label",
+            color_discrete_map={"Normal": "#2ecc71", "Anomaly": "#e74c3c"},
+            title="Sample index vs message length (colored by model prediction)",
+            labels={
+                "row_index": "Row index in sample",
+                len_col: y_title,
+                "prediction_label": "Model prediction",
+            },
+        )
+        fig_scatter.update_traces(marker=dict(size=8, opacity=0.65))
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Log Anomaly Detection Dashboard",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+
+    if not st.session_state["logged_in"]:
+        st.title("Log Anomaly Detection Dashboard")
+        render_login()
+        return
 
     with st.sidebar:
+        st.markdown(f"**Signed in as** `{st.session_state.get('username', 'user')}`")
+        if st.button("Log out"):
+            for k in (
+                "logged_in",
+                "username",
+                "upload_sig",
+                "saved_path",
+                "result_df",
+                "n_parse_fail",
+            ):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+        st.divider()
         st.header("Sampling")
         sampling_mode = st.radio(
             "Sampling mode",
@@ -306,43 +466,124 @@ def main():
         )
         st.caption(
             "Random mode uses **reservoir sampling**: one pass through the upload, "
-            f"only **{MAX_LINES:,}** lines kept in memory. Large uploads may take longer to scan."
+            f"only **{MAX_LINES:,}** lines kept in memory."
         )
 
     st.title("Log Anomaly Detection Dashboard")
     st.info(
         "Free version: up to 10,000 lines. Upgrade for full dataset processing."
     )
-    if sampling_mode == "random":
-        st.caption(
-            f"**{MAX_LINES:,}** lines drawn by **uniform random sampling** over the full upload "
-            f"(seed **{sample_seed}**). Not the same as file order."
-        )
-    else:
-        st.caption(
-            f"**{MAX_LINES:,}** lines from the **start** of the file (head only)."
-        )
 
-    try:
-        with st.spinner("Loading log sample from upload..."):
-            df = load_log_sample_from_upload(
-                uploaded, sampling_mode, MAX_LINES, int(sample_seed)
-            )
-    except Exception as e:
-        st.error(f"Could not read the uploaded file: {e}")
+    # --- Upload ---
+    st.markdown("## Upload")
+    st.warning(
+        "⚠️ Maximum file size is 200MB (Streamlit Cloud limit). "
+        "For larger logs, please upload a smaller sample."
+    )
+    st.info(
+        "This app processes only up to 10,000 lines using efficient sampling, "
+        "so you can upload a smaller portion of your log file."
+    )
+
+    uploaded = st.file_uploader(
+        "Choose a log file",
+        type=["log", "txt"],
+        help="Plain-text logs (e.g. BGL).",
+    )
+    if uploaded is None:
+        st.warning("Please upload a log file to continue.")
         st.stop()
 
-    with st.spinner("Parsing log lines..."):
-        df, parse_ok = add_parsed_columns(df)
+    upload_size = _uploaded_file_size_bytes(uploaded)
+    uploaded.seek(0)
+    if upload_size > MAX_UPLOAD_BYTES:
+        size_mb = upload_size / (1024 * 1024)
+        st.error(
+            f"This file is about **{size_mb:.1f} MB**, which exceeds the "
+            f"**{MAX_UPLOAD_MB} MB** limit supported on Streamlit Cloud. "
+            "Please export a smaller slice of your log and try again."
+        )
+        st.stop()
 
-    failed = int((~parse_ok).sum())
-    if failed:
+    sig = (uploaded.name, upload_size)
+    if st.session_state.get("upload_sig") != sig:
+        try:
+            dest = save_upload_to_disk(uploaded)
+        except OSError as e:
+            st.error(f"Could not save upload: {e}")
+            st.stop()
+        st.session_state["upload_sig"] = sig
+        st.session_state["saved_path"] = str(dest)
+        saved_path = dest
+        st.success("File uploaded and saved successfully")
+        try:
+            with st.spinner("Processing log file..."):
+                df_new, n_fail_new = process_log_file(
+                    saved_path,
+                    sampling_mode=sampling_mode,
+                    max_lines=MAX_LINES,
+                    sample_seed=int(sample_seed),
+                )
+            st.session_state["result_df"] = df_new
+            st.session_state["n_parse_fail"] = n_fail_new
+        except Exception as e:
+            st.error(f"Processing failed: {e}")
+            st.session_state.pop("result_df", None)
+            st.session_state.pop("n_parse_fail", None)
+            st.stop()
+    else:
+        saved_path = Path(st.session_state["saved_path"])
+
+    st.caption(f"Uploaded file size: {upload_size / (1024 * 1024):.2f} MB")
+
+    # --- Analysis ---
+    st.markdown("---")
+    st.markdown("## Analysis")
+    st.caption(
+        f"**{MAX_LINES:,}** lines — "
+        + (
+            f"uniform **random** sampling (seed **{sample_seed}**)."
+            if sampling_mode == "random"
+            else "**first** lines of the saved file."
+        )
+    )
+    st.caption(
+        "Adjust sampling in the sidebar, then click below to re-run **process_log_file** on the saved upload."
+    )
+
+    rerun = st.button("Re-run analysis with current sampling settings", type="secondary")
+    if rerun:
+        try:
+            with st.spinner("Re-processing log file..."):
+                df_new, n_fail_new = process_log_file(
+                    saved_path,
+                    sampling_mode=sampling_mode,
+                    max_lines=MAX_LINES,
+                    sample_seed=int(sample_seed),
+                )
+            st.session_state["result_df"] = df_new
+            st.session_state["n_parse_fail"] = n_fail_new
+            st.rerun()
+        except Exception as e:
+            st.error(f"Processing failed: {e}")
+            st.stop()
+
+    if "result_df" not in st.session_state:
+        st.warning("No results yet. Upload a file or fix the error above.")
+        st.stop()
+
+    df = st.session_state["result_df"]
+    n_failed = int(st.session_state.get("n_parse_fail", 0))
+
+    # --- Results ---
+    st.markdown("---")
+    st.markdown("## Results")
+
+    if n_failed:
         st.warning(
-            f"{failed:,} line(s) did not match the standard BGL layout; "
+            f"{n_failed:,} line(s) did not match the standard BGL layout; "
             "those rows use fallbacks (see **clean_message**)."
         )
-
-    df["msg_length"] = df["message"].str.len()
 
     parsed_cols = [
         "label",
@@ -353,25 +594,21 @@ def main():
         "message",
     ]
 
-    st.subheader("Parsed log (first 100 rows)")
+    st.subheader("Parsed preview (first 100 rows)")
     st.dataframe(
         df[parsed_cols].head(100),
         use_container_width=True,
         hide_index=True,
     )
 
-    st.subheader("Message length (loaded lines)")
+    st.subheader("Message length (line chart)")
     st.line_chart(df[["msg_length"]])
 
-    if len(df) < 2:
-        st.info("Need at least 2 log lines to run anomaly detection.")
-        df = add_ground_truth_labels(df)
-        df["anomaly"] = 0
-    else:
-        with st.spinner("Running Isolation Forest..."):
-            df = run_isolation_forest(df)
+    render_charts(df)
 
-        df = add_ground_truth_labels(df)
+    if len(df) < 2:
+        st.info("Need at least 2 log lines for Isolation Forest; export still includes parsed rows.")
+    else:
         y_true = df["true_anomaly"]
         y_pred = df["anomaly"]
 
@@ -386,11 +623,9 @@ def main():
         n_normal_gt = int((y_true == 0).sum())
         n_anom_gt = int((y_true == 1).sum())
         st.caption(
-            "**true_anomaly** = **0** only when the first field of the line is **`-`** "
-            "(normal); **1** for any other first token (e.g. **E**, **APPREAD**). "
-            "Derived from the raw **message** line (first token, Unicode dash normalized). "
+            "**true_anomaly** = **0** only when the first field is **`-`**; **1** otherwise. "
             f"In this sample: **{n_normal_gt:,}** normal, **{n_anom_gt:,}** true anomalies. "
-            "Compared to model **anomaly** (Isolation Forest). Positive class = **1** (anomaly)."
+            "Positive class = **1** (anomaly)."
         )
 
         acc = accuracy_score(y_true, y_pred)
@@ -447,18 +682,6 @@ def main():
         file_name="anomaly_results.csv",
         mime="text/csv",
     )
-
-    if len(df) >= 2:
-        st.subheader("Anomalies in the sample (row index)")
-        viz = df.copy()
-        viz["row_index"] = range(len(viz))
-        viz["status"] = viz["anomaly"].map({0: "normal", 1: "anomaly"})
-        st.scatter_chart(
-            viz,
-            x="row_index",
-            y="clean_msg_length",
-            color="status",
-        )
 
 
 if __name__ == "__main__":
