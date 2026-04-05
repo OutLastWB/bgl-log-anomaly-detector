@@ -251,7 +251,7 @@ def confusion_matrix_table(y_true, y_pred) -> pd.DataFrame:
 
 
 def main():
-    st.set_page_config(page_title="BGL log preview", layout="wide")
+    st.set_page_config(page_title="Log Anomaly Detection Dashboard", layout="wide")
 
     st.warning(
         "⚠️ Maximum file size is 200MB (Streamlit Cloud limit). "
@@ -282,6 +282,8 @@ def main():
         )
         st.stop()
 
+    st.caption(f"Uploaded file size: {upload_size / (1024 * 1024):.2f} MB")
+
     with st.sidebar:
         st.header("Sampling")
         sampling_mode = st.radio(
@@ -307,7 +309,10 @@ def main():
             f"only **{MAX_LINES:,}** lines kept in memory. Large uploads may take longer to scan."
         )
 
-    st.title("BGL log preview")
+    st.title("Log Anomaly Detection Dashboard")
+    st.info(
+        "Free version: up to 10,000 lines. Upgrade for full dataset processing."
+    )
     if sampling_mode == "random":
         st.caption(
             f"**{MAX_LINES:,}** lines drawn by **uniform random sampling** over the full upload "
@@ -432,6 +437,33 @@ def main():
             use_container_width=True,
             hide_index=True,
         )
+
+    st.subheader("Export results")
+    export_cols = [
+        c
+        for c in (
+            "label",
+            "timestamp",
+            "node",
+            "type",
+            "clean_message",
+            "message",
+            "msg_length",
+            "clean_msg_length",
+            "hour_of_day",
+            "true_anomaly",
+            "anomaly",
+        )
+        if c in df.columns
+    ]
+    csv_payload = df[export_cols].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download processed results (CSV)",
+        data=csv_payload,
+        file_name="anomaly_results.csv",
+        mime="text/csv",
+        help="Includes parsed fields, ground truth (true_anomaly), and model predictions (anomaly).",
+    )
 
     st.subheader("Anomalies in the sample (row index)")
     viz = df.copy()
