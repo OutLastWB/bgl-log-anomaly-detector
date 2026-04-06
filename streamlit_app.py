@@ -16,6 +16,7 @@ from typing import BinaryIO, Tuple, Union
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import (
@@ -39,6 +40,7 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 UPLOAD_DIR = Path("uploads")
 _TS_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}-\d{2}\.\d{2}\.\d{2}(?:\.\d+)?)\b")
+API_URL = "http://127.0.0.1:8000/analyze"
 
 
 # ---------------------------------------------------------------------------
@@ -574,31 +576,31 @@ def main() -> None:
         st.caption(f"Pasted lines: {len(pasted_logs.splitlines()):,}")
         st.session_state["input_sig"] = source_sig
 
-    def _run_processing() -> tuple[pd.DataFrame, int]:
+    def _run_processing_via_api() -> dict:
         if input_mode == "Upload file":
-            source = Path(st.session_state["saved_path"])
+            with open(st.session_state["saved_path"], "rb") as f:
+                files = {"file": ("uploaded.log", f, "text/plain")}
+                response = requests.post(API_URL, files=files, timeout=120)
         else:
-            source = io.BytesIO(pasted_logs.encode("utf-8"))
-        return process_log_file(
-            source,
-            sampling_mode=sampling_mode,
-            max_lines=MAX_LINES,
-            sample_seed=int(sample_seed),
-            contamination=float(contamination),
-            n_estimators=int(n_estimators),
-        )
+            paste_file = io.BytesIO(pasted_logs.encode("utf-8"))
+            files = {"file": ("pasted_logs.log", paste_file, "text/plain")}
+            response = requests.post(API_URL, files=files, timeout=120)
+        response.raise_for_status()
+        return response.json()
 
     if st.session_state.get("result_sig") != source_sig:
         try:
-            with st.spinner("Processing log input..."):
-                df_new, n_fail_new = _run_processing()
-            st.session_state["result_df"] = df_new
-            st.session_state["n_parse_fail"] = n_fail_new
+            with st.spinner("Sending logs to API for analysis..."):
+                api_data = _run_processing_via_api()
+            st.session_state["api_result"] = api_data
             st.session_state["result_sig"] = source_sig
-        except Exception as e:
-            st.error(f"Processing failed: {e}")
-            st.session_state.pop("result_df", None)
-            st.session_state.pop("n_parse_fail", None)
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach FastAPI backend at `{API_URL}`: {e}")
+            st.session_state.pop("api_result", None)
+            st.stop()
+        except ValueError:
+            st.error("Backend returned an invalid JSON response.")
+            st.session_state.pop("api_result", None)
             st.stop()
 
     # --- Analysis ---
@@ -613,28 +615,34 @@ def main() -> None:
         )
     )
     st.caption(
-        "Adjust sampling/settings in the sidebar, then click below to re-run **process_log_file**."
+        "Adjust sampling/settings in the sidebar, then click below to re-run API analysis."
     )
 
     rerun = st.button("Re-run analysis with current settings", type="secondary")
     if rerun:
         try:
-            with st.spinner("Re-processing logs..."):
-                df_new, n_fail_new = _run_processing()
-            st.session_state["result_df"] = df_new
-            st.session_state["n_parse_fail"] = n_fail_new
+            with st.spinner("Sending logs to API for analysis..."):
+                api_data = _run_processing_via_api()
+            st.session_state["api_result"] = api_data
             st.session_state["result_sig"] = source_sig
             st.rerun()
-        except Exception as e:
-            st.error(f"Processing failed: {e}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Could not reach FastAPI backend at `{API_URL}`: {e}")
+            st.stop()
+        except ValueError:
+            st.error("Backend returned an invalid JSON response.")
             st.stop()
 
-    if "result_df" not in st.session_state:
-        st.warning("No results yet. Upload a file or fix the error above.")
+    if "api_result" not in st.session_state:
+        st.warning("No analysis result yet. Upload/paste logs or fix the API error above.")
         st.stop()
 
-    df = st.session_state["result_df"]
-    n_failed = int(st.session_state.get("n_parse_fail", 0))
+    api_result = st.session_state["api_result"]
+    total_rows = int(api_result.get("total_rows", 0))
+    n_failed = int(api_result.get("failed_parsing", 0))
+    anomalies = int(api_result.get("anomalies", 0))
+    sample_rows = api_result.get("sample", [])
+    df = pd.DataFrame(sample_rows) if isinstance(sample_rows, list) else pd.DataFrame()
     search_query = st.text_input(
         "Search logs by message content",
         placeholder="Type keyword(s) to filter by message / clean_message...",
@@ -659,6 +667,13 @@ def main() -> None:
     # --- Results ---
     st.markdown("---")
     st.markdown("## Results")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("total_rows", f"{total_rows:,}")
+    m2.metric("failed_parsing", f"{n_failed:,}")
+    m3.metric("anomalies", f"{anomalies:,}")
+    st.subheader("sample")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    return
 
     if n_failed:
         st.warning(
