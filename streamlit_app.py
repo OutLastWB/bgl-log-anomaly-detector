@@ -180,7 +180,12 @@ def add_parsed_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
     return out, parse_ok
 
 
-def run_isolation_forest(df: pd.DataFrame) -> pd.DataFrame:
+def run_isolation_forest(
+    df: pd.DataFrame,
+    *,
+    contamination: float = 0.05,
+    n_estimators: int = 100,
+) -> pd.DataFrame:
     """
     Build numeric features, fit Isolation Forest, add column anomaly (1 = outlier).
 
@@ -214,12 +219,15 @@ def run_isolation_forest(df: pd.DataFrame) -> pd.DataFrame:
     X = out[feature_cols].astype("float64")
 
     model = IsolationForest(
-        n_estimators=100,
-        contamination=0.05,
+        n_estimators=n_estimators,
+        contamination=contamination,
         random_state=42,
     )
     pred = model.fit_predict(X)
+    # Lower score means "more abnormal" for Isolation Forest.
+    out["anomaly_score"] = model.decision_function(X)
     out["anomaly"] = (pred == -1).astype(int)
+    out["severity"] = out["anomaly"].map({0: "Normal", 1: "High Risk"})
     out = out.drop(columns=["_node", "_type"])
     return out
 
@@ -272,6 +280,8 @@ def process_log_file(
     sampling_mode: str = "random",
     max_lines: int = MAX_LINES,
     sample_seed: int = 42,
+    contamination: float = 0.05,
+    n_estimators: int = 100,
 ) -> Tuple[pd.DataFrame, int]:
     """
     Run sampling → parse → features + Isolation Forest → ground-truth labels.
@@ -305,8 +315,14 @@ def process_log_file(
         if len(df) < 2:
             df = add_ground_truth_labels(df)
             df["anomaly"] = 0
+            df["anomaly_score"] = 0.0
+            df["severity"] = "Normal"
         else:
-            df = run_isolation_forest(df)
+            df = run_isolation_forest(
+                df,
+                contamination=contamination,
+                n_estimators=n_estimators,
+            )
             df = add_ground_truth_labels(df)
     finally:
         if close_after:
@@ -468,6 +484,24 @@ def main() -> None:
             "Random mode uses **reservoir sampling**: one pass through the upload, "
             f"only **{MAX_LINES:,}** lines kept in memory."
         )
+        st.divider()
+        st.header("Model settings")
+        contamination = st.slider(
+            "Contamination",
+            min_value=0.01,
+            max_value=0.2,
+            value=0.05,
+            step=0.01,
+            help="Expected fraction of anomalies for Isolation Forest.",
+        )
+        n_estimators = st.slider(
+            "n_estimators",
+            min_value=50,
+            max_value=300,
+            value=100,
+            step=10,
+            help="Number of trees in Isolation Forest.",
+        )
 
     st.title("Log Anomaly Detection Dashboard")
     st.info(
@@ -523,6 +557,8 @@ def main() -> None:
                     sampling_mode=sampling_mode,
                     max_lines=MAX_LINES,
                     sample_seed=int(sample_seed),
+                    contamination=float(contamination),
+                    n_estimators=int(n_estimators),
                 )
             st.session_state["result_df"] = df_new
             st.session_state["n_parse_fail"] = n_fail_new
@@ -560,6 +596,8 @@ def main() -> None:
                     sampling_mode=sampling_mode,
                     max_lines=MAX_LINES,
                     sample_seed=int(sample_seed),
+                    contamination=float(contamination),
+                    n_estimators=int(n_estimators),
                 )
             st.session_state["result_df"] = df_new
             st.session_state["n_parse_fail"] = n_fail_new
@@ -574,6 +612,21 @@ def main() -> None:
 
     df = st.session_state["result_df"]
     n_failed = int(st.session_state.get("n_parse_fail", 0))
+    search_query = st.text_input(
+        "Search logs by message content",
+        placeholder="Type keyword(s) to filter by message / clean_message...",
+    ).strip()
+    if search_query:
+        mask = (
+            df["message"].astype(str).str.contains(search_query, case=False, na=False)
+            | df["clean_message"]
+            .astype(str)
+            .str.contains(search_query, case=False, na=False)
+        )
+        df_view = df[mask].copy()
+        st.caption(f"Filtered rows: {len(df_view):,} / {len(df):,}")
+    else:
+        df_view = df.copy()
 
     # --- Results ---
     st.markdown("---")
@@ -596,15 +649,15 @@ def main() -> None:
 
     st.subheader("Parsed preview (first 100 rows)")
     st.dataframe(
-        df[parsed_cols].head(100),
+        df_view[parsed_cols].head(100),
         use_container_width=True,
         hide_index=True,
     )
 
     st.subheader("Message length (line chart)")
-    st.line_chart(df[["msg_length"]])
+    st.line_chart(df_view[["msg_length"]])
 
-    render_charts(df)
+    render_charts(df_view)
 
     if len(df) < 2:
         st.info("Need at least 2 log lines for Isolation Forest; export still includes parsed rows.")
@@ -616,7 +669,8 @@ def main() -> None:
         st.subheader("Anomaly detection (Isolation Forest)")
         st.caption(
             "Features: message length, hour, node/type counts in this sample, "
-            "label-encoded node and type. **contamination = 0.05**"
+            f"label-encoded node and type. **contamination = {contamination:.2f}**, "
+            f"**n_estimators = {int(n_estimators)}**"
         )
 
         st.subheader("Evaluation vs BGL ground truth")
@@ -654,7 +708,7 @@ def main() -> None:
         m1.metric("Predicted anomalies", f"{n_anom:,}")
         m2.metric("Predicted anomaly rate", f"{pct:.2f}%")
 
-        anomalies = df[df["anomaly"] == 1]
+        anomalies = df_view[df_view["anomaly"] == 1]
         st.subheader("Anomalous logs")
         if anomalies.empty:
             st.success("No rows flagged as anomalies with the current settings.")
@@ -666,10 +720,46 @@ def main() -> None:
                 "clean_message",
                 "clean_msg_length",
                 "hour_of_day",
+                "anomaly_score",
                 "anomaly",
+                "severity",
             ]
             st.dataframe(
                 anomalies[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.subheader("Top anomalies")
+        top_sort = st.radio(
+            "Rank top anomalies by",
+            options=["message length", "anomaly score"],
+            horizontal=True,
+        )
+        top_anomalies = df_view[df_view["anomaly"] == 1].copy()
+        if top_anomalies.empty:
+            st.info("No anomalous rows available for top-10 ranking.")
+        else:
+            if top_sort == "message length":
+                top_anomalies = top_anomalies.sort_values(
+                    "clean_msg_length", ascending=False
+                )
+            else:
+                top_anomalies = top_anomalies.sort_values(
+                    "anomaly_score", ascending=True
+                )
+            st.dataframe(
+                top_anomalies[
+                    [
+                        "timestamp",
+                        "node",
+                        "type",
+                        "clean_message",
+                        "clean_msg_length",
+                        "anomaly_score",
+                        "severity",
+                    ]
+                ].head(10),
                 use_container_width=True,
                 hide_index=True,
             )
