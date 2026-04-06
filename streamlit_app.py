@@ -628,6 +628,11 @@ def main() -> None:
     else:
         df_view = df.copy()
 
+    show_only_anomalies = st.checkbox("Show only anomalies", value=False)
+    if show_only_anomalies:
+        df_view = df_view[df_view["anomaly"] == 1].copy()
+        st.caption(f"Anomaly-only rows: {len(df_view):,}")
+
     # --- Results ---
     st.markdown("---")
     st.markdown("## Results")
@@ -708,6 +713,21 @@ def main() -> None:
         m1.metric("Predicted anomalies", f"{n_anom:,}")
         m2.metric("Predicted anomaly rate", f"{pct:.2f}%")
 
+        if pct > 10.0:
+            st.error(
+                "Automatic insight: High anomaly rate detected (>10%). "
+                "This may indicate a major incident or unstable system behavior."
+            )
+        elif pct > 5.0:
+            st.warning(
+                "Automatic insight: Elevated anomaly rate detected (>5%). "
+                "Review abnormal patterns and monitor closely."
+            )
+        else:
+            st.success(
+                "Automatic insight: Anomaly rate is within expected range (<=5%)."
+            )
+
         anomalies = df_view[df_view["anomaly"] == 1]
         st.subheader("Anomalous logs")
         if anomalies.empty:
@@ -763,6 +783,29 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        st.subheader("Anomalies per hour")
+        if "hour_of_day" in df.columns:
+            hourly = (
+                df[df["anomaly"] == 1]
+                .groupby("hour_of_day", dropna=False)
+                .size()
+                .reset_index(name="anomaly_count")
+                .sort_values("hour_of_day")
+            )
+            fig_hourly = px.bar(
+                hourly,
+                x="hour_of_day",
+                y="anomaly_count",
+                title="Detected anomalies by hour of day",
+                labels={
+                    "hour_of_day": "Hour of day (-1 means unknown timestamp)",
+                    "anomaly_count": "Anomaly count",
+                },
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True)
+        else:
+            st.info("Hour-based analysis is unavailable for this dataset.")
 
     st.subheader("Export Results")
     csv_data = df.to_csv(index=False).encode("utf-8")
