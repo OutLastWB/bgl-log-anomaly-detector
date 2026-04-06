@@ -8,6 +8,7 @@ from __future__ import annotations
 import random
 import re
 import uuid
+import io
 from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Tuple, Union
@@ -453,6 +454,8 @@ def main() -> None:
                 "logged_in",
                 "username",
                 "upload_sig",
+                "input_sig",
+                "result_sig",
                 "saved_path",
                 "result_df",
                 "n_parse_fail",
@@ -508,7 +511,7 @@ def main() -> None:
         "Free version: up to 10,000 lines. Upgrade for full dataset processing."
     )
 
-    # --- Upload ---
+    # --- Upload / Input ---
     st.markdown("## Upload")
     st.warning(
         "⚠️ Maximum file size is 200MB (Streamlit Cloud limit). "
@@ -519,58 +522,84 @@ def main() -> None:
         "so you can upload a smaller portion of your log file."
     )
 
-    uploaded = st.file_uploader(
-        "Choose a log file",
-        type=["log", "txt"],
-        help="Plain-text logs (e.g. BGL).",
+    input_mode = st.radio(
+        "Input source",
+        options=["Upload file", "Paste logs"],
+        horizontal=True,
     )
-    if uploaded is None:
-        st.warning("Please upload a log file to continue.")
-        st.stop()
 
-    upload_size = _uploaded_file_size_bytes(uploaded)
-    uploaded.seek(0)
-    if upload_size > MAX_UPLOAD_BYTES:
-        size_mb = upload_size / (1024 * 1024)
-        st.error(
-            f"This file is about **{size_mb:.1f} MB**, which exceeds the "
-            f"**{MAX_UPLOAD_MB} MB** limit supported on Streamlit Cloud. "
-            "Please export a smaller slice of your log and try again."
+    source_sig: tuple
+    if input_mode == "Upload file":
+        uploaded = st.file_uploader(
+            "Choose a log file",
+            type=["log", "txt"],
+            help="Plain-text logs (e.g. BGL).",
         )
-        st.stop()
-
-    sig = (uploaded.name, upload_size)
-    if st.session_state.get("upload_sig") != sig:
-        try:
-            dest = save_upload_to_disk(uploaded)
-        except OSError as e:
-            st.error(f"Could not save upload: {e}")
+        if uploaded is None:
+            st.warning("Please upload a log file to continue.")
             st.stop()
-        st.session_state["upload_sig"] = sig
-        st.session_state["saved_path"] = str(dest)
-        saved_path = dest
-        st.success("File uploaded and saved successfully")
+
+        upload_size = _uploaded_file_size_bytes(uploaded)
+        uploaded.seek(0)
+        if upload_size > MAX_UPLOAD_BYTES:
+            size_mb = upload_size / (1024 * 1024)
+            st.error(
+                f"This file is about **{size_mb:.1f} MB**, which exceeds the "
+                f"**{MAX_UPLOAD_MB} MB** limit supported on Streamlit Cloud. "
+                "Please export a smaller slice of your log and try again."
+            )
+            st.stop()
+
+        source_sig = ("upload", uploaded.name, upload_size)
+        if st.session_state.get("input_sig") != source_sig:
+            try:
+                dest = save_upload_to_disk(uploaded)
+            except OSError as e:
+                st.error(f"Could not save upload: {e}")
+                st.stop()
+            st.session_state["input_sig"] = source_sig
+            st.session_state["saved_path"] = str(dest)
+            st.success("File uploaded and saved successfully")
+        st.caption(f"Uploaded file size: {upload_size / (1024 * 1024):.2f} MB")
+    else:
+        pasted_logs = st.text_area(
+            "Paste log lines",
+            height=220,
+            placeholder="Paste one log message per line...",
+        )
+        if not pasted_logs.strip():
+            st.warning("Please paste log lines to continue.")
+            st.stop()
+        source_sig = ("paste", len(pasted_logs), pasted_logs[:1000])
+        st.caption(f"Pasted lines: {len(pasted_logs.splitlines()):,}")
+        st.session_state["input_sig"] = source_sig
+
+    def _run_processing() -> tuple[pd.DataFrame, int]:
+        if input_mode == "Upload file":
+            source = Path(st.session_state["saved_path"])
+        else:
+            source = io.BytesIO(pasted_logs.encode("utf-8"))
+        return process_log_file(
+            source,
+            sampling_mode=sampling_mode,
+            max_lines=MAX_LINES,
+            sample_seed=int(sample_seed),
+            contamination=float(contamination),
+            n_estimators=int(n_estimators),
+        )
+
+    if st.session_state.get("result_sig") != source_sig:
         try:
-            with st.spinner("Processing log file..."):
-                df_new, n_fail_new = process_log_file(
-                    saved_path,
-                    sampling_mode=sampling_mode,
-                    max_lines=MAX_LINES,
-                    sample_seed=int(sample_seed),
-                    contamination=float(contamination),
-                    n_estimators=int(n_estimators),
-                )
+            with st.spinner("Processing log input..."):
+                df_new, n_fail_new = _run_processing()
             st.session_state["result_df"] = df_new
             st.session_state["n_parse_fail"] = n_fail_new
+            st.session_state["result_sig"] = source_sig
         except Exception as e:
             st.error(f"Processing failed: {e}")
             st.session_state.pop("result_df", None)
             st.session_state.pop("n_parse_fail", None)
             st.stop()
-    else:
-        saved_path = Path(st.session_state["saved_path"])
-
-    st.caption(f"Uploaded file size: {upload_size / (1024 * 1024):.2f} MB")
 
     # --- Analysis ---
     st.markdown("---")
@@ -580,27 +609,21 @@ def main() -> None:
         + (
             f"uniform **random** sampling (seed **{sample_seed}**)."
             if sampling_mode == "random"
-            else "**first** lines of the saved file."
+            else "**first** lines of the selected input."
         )
     )
     st.caption(
-        "Adjust sampling in the sidebar, then click below to re-run **process_log_file** on the saved upload."
+        "Adjust sampling/settings in the sidebar, then click below to re-run **process_log_file**."
     )
 
-    rerun = st.button("Re-run analysis with current sampling settings", type="secondary")
+    rerun = st.button("Re-run analysis with current settings", type="secondary")
     if rerun:
         try:
-            with st.spinner("Re-processing log file..."):
-                df_new, n_fail_new = process_log_file(
-                    saved_path,
-                    sampling_mode=sampling_mode,
-                    max_lines=MAX_LINES,
-                    sample_seed=int(sample_seed),
-                    contamination=float(contamination),
-                    n_estimators=int(n_estimators),
-                )
+            with st.spinner("Re-processing logs..."):
+                df_new, n_fail_new = _run_processing()
             st.session_state["result_df"] = df_new
             st.session_state["n_parse_fail"] = n_fail_new
+            st.session_state["result_sig"] = source_sig
             st.rerun()
         except Exception as e:
             st.error(f"Processing failed: {e}")
