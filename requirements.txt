@@ -7,3 +7,5 @@ plotly
 uvicorn
 fastapi
 pymongo
+bcrypt
+passlib[bcrypt]
