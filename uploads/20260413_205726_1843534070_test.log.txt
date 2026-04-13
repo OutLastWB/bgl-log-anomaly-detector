@@ -1,0 +1,2 @@
+- 1 2024.01.01 node1 2024-01-01-10.00.00 node1 RAS KERNEL INFO Test log message
+E 2 2024.01.01 node2 2024-01-01-10.00.01 node2 RAS KERNEL ERROR Something failed
