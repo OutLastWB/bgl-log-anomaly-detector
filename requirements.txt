@@ -9,3 +9,4 @@ fastapi
 pymongo
 bcrypt
 passlib[bcrypt]
+python-dotenv
