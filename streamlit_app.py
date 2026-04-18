@@ -29,7 +29,7 @@ MAX_UPLOAD_MB = 200
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 UPLOAD_DIR = Path("uploads")
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = "https://bgl-log-anomaly-detector.onrender.com"
 API_URL = f"{API_BASE}/analyze"
 LOGS_URL = f"{API_BASE}/logs"
 
