@@ -10,3 +10,4 @@ pymongo
 bcrypt
 passlib[bcrypt]
 python-dotenv
+python-jose[cryptography]

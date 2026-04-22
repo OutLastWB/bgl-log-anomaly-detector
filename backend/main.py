@@ -4,7 +4,7 @@ from auth import create_user, authenticate_user
 from database import logs_collection
 from datetime import datetime, timezone
 from pydantic import BaseModel
-from backend.jwt_utils import create_access_token, verify_token
+from jwt_utils import create_access_token, verify_token
 import tempfile
 import shutil
 
