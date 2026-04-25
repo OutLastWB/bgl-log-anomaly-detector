@@ -1,17 +1,19 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+import tempfile
+import shutil
+import sys
+import os
+
+# Fix import paths for both local and Render
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from jwt_utils import create_access_token, verify_token
 from auth import create_user, authenticate_user
 from database import logs_collection
 from datetime import datetime, timezone
-from pydantic import BaseModel
-from jwt_utils import create_access_token, verify_token
-import tempfile
-import shutil
-
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from utils.log_processor import process_log_file
 
 app = FastAPI()
